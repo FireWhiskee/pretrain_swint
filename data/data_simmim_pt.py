@@ -43,36 +43,112 @@ class MaskGenerator:
         mask = mask.repeat(self.scale, axis=0).repeat(self.scale, axis=1)
         
         return mask
+# --------------------------------------------------------
+# SimMIM (Custom Dataset Edition)
+# Modified for single-image training and custom datasets
+# --------------------------------------------------------
+
+import os
+import math
+import random
+import numpy as np
+from PIL import Image
+import torch
+import torch.distributed as dist
+import torchvision.transforms as T
+from torch.utils.data import Dataset, DataLoader
+
+class CustomImageDataset(Dataset):
+    """支持单图/自定义路径的增强型数据集"""
+    def __init__(self, img_paths, img_size=224, repeat_factor=1000):
+        """
+        Args:
+            img_paths (str/list): 单图路径或多图路径列表
+            img_size (int): 模型输入尺寸
+            repeat_factor (int): 单图重复次数模拟大数据集
+        """
+        if isinstance(img_paths, str):
+            self.img_paths = [img_paths]
+        else:
+            self.img_paths = img_paths
+            
+        self.images = [Image.open(p).convert('RGB') for p in self.img_paths]
+        self.img_size = img_size
+        self.repeat_factor = repeat_factor
+        
+        # 动态增强策略（保留与ImageNet相同的归一化参数）
+        self.base_transform = T.Compose([
+            T.RandomResizedCrop(img_size, scale=(0.67, 1.), ratio=(3./4., 4./3.)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], 
+                       std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.img_paths) * self.repeat_factor
+
+    def __getitem__(self, idx):
+        # 循环使用图像
+        img = self.images[idx % len(self.img_paths)].copy()  
+        return self.base_transform(img)
+
 
 
 class SimMIMTransform:
+    """适配自定义数据集的增强转换"""
     def __init__(self, config):
-        self.transform_img = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.RandomResizedCrop(config.DATA.IMG_SIZE, scale=(0.67, 1.), ratio=(3. / 4., 4. / 3.)),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(mean=torch.tensor(IMAGENET_DEFAULT_MEAN),std=torch.tensor(IMAGENET_DEFAULT_STD)),
-        ])
- 
-        if config.MODEL.TYPE in ['swin', 'swinv2']:
-            model_patch_size=config.MODEL.SWIN.PATCH_SIZE
-        else:
-            raise NotImplementedError
-        
         self.mask_generator = MaskGenerator(
             input_size=config.DATA.IMG_SIZE,
             mask_patch_size=config.DATA.MASK_PATCH_SIZE,
-            model_patch_size=model_patch_size,
-            mask_ratio=config.DATA.MASK_RATIO,
+            model_patch_size=config.MODEL.SWIN.PATCH_SIZE,
+            mask_ratio=config.DATA.MASK_RATIO
         )
-    
-    def __call__(self, img):
-        img = self.transform_img(img)
-        mask = self.mask_generator()
-        
-        return img, mask
 
+    def __call__(self, img_tensor):
+        # 在张量上生成掩码（与图像增强解耦）
+        mask = self.mask_generator()
+        return img_tensor, torch.from_numpy(mask).float()
+
+def build_loader_simmim(config):
+    """重构数据加载流程"""
+    # 自定义数据集初始化
+    dataset = CustomImageDataset(
+        img_paths=["/content/data/train/class1/00014.jpg"],  # 单图或多图路径
+        img_size=config.DATA.IMG_SIZE,
+        repeat_factor=1000  # 控制单图重复次数
+    )
+    
+    # 添加MIM转换层
+    mim_transform = SimMIMTransform(config)
+    dataset = TransformWrapper(dataset, mim_transform)
+    
+    # 分布式处理适配
+    sampler = DistributedSampler(dataset) if dist.is_initialized() else None
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.DATA.BATCH_SIZE,
+        sampler=sampler,
+        num_workers=config.DATA.NUM_WORKERS,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    return dataloader
+
+class TransformWrapper(Dataset):
+    """转换流水线封装器"""
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img = self.dataset[idx]
+        return self.transform(img)
 
 def collate_fn(batch):
     if not isinstance(batch[0][0], tuple):
@@ -87,13 +163,3 @@ def collate_fn(batch):
                 ret.append(default_collate([batch[i][0][item_idx] for i in range(batch_num)]))
         ret.append(default_collate([batch[i][1] for i in range(batch_num)]))
         return ret
-
-
-def build_loader_simmim(config):
-    transform = SimMIMTransform(config)
-    dataset = ImageFolder(config.DATA.DATA_PATH, transform)
-    
-    sampler = DistributedSampler(dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True)
-    dataloader = DataLoader(dataset, config.DATA.BATCH_SIZE, sampler=sampler, num_workers=config.DATA.NUM_WORKERS, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-    
-    return dataloader

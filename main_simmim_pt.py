@@ -24,7 +24,7 @@ from data import build_loader
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils_simmim import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper
+from utils_simmim import load_pretrained, load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper
 
 # pytorch major version (1.x or 2.x)
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
@@ -44,6 +44,7 @@ def parse_option():
     parser.add_argument('--batch-size', type=int, help="batch size for single GPU")
     parser.add_argument('--data-path', type=str, help='path to dataset')
     parser.add_argument('--resume', help='resume from checkpoint')
+    parser.add_argument('--pretrained',help='pretrained weight from checkpoint, could be imagenet22k pretrained weight')
     parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
     parser.add_argument('--use-checkpoint', action='store_true',
                         help="whether to use gradient checkpointing to save memory")
@@ -65,6 +66,57 @@ def parse_option():
     config = get_config(args)
 
     return args, config
+
+
+
+@torch.no_grad()
+def validate(config, data_loader, model):
+    criterion = torch.nn.CrossEntropyLoss()
+    model.eval()
+
+    batch_time = AverageMeter()
+    loss_meter = AverageMeter()
+    acc1_meter = AverageMeter()
+    acc5_meter = AverageMeter()
+
+    end = time.time()
+    for idx, (images, target) in enumerate(data_loader):
+        images = images.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+
+        # compute output
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+            output = model(images)
+
+        # measure accuracy and record loss
+        loss = criterion(output, target)
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        acc1 = reduce_tensor(acc1)
+        acc5 = reduce_tensor(acc5)
+        loss = reduce_tensor(loss)
+
+        loss_meter.update(loss.item(), target.size(0))
+        acc1_meter.update(acc1.item(), target.size(0))
+        acc5_meter.update(acc5.item(), target.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if idx % config.PRINT_FREQ == 0:
+            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            logger.info(
+                f'Test: [{idx}/{len(data_loader)}]\t'
+                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
+                f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
+                f'Mem {memory_used:.0f}MB')
+    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+    return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
+
+
 
 
 def main(config):
@@ -103,6 +155,12 @@ def main(config):
     if config.MODEL.RESUME:
         load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, scaler, logger)
 
+    if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
+        load_pretrained(config, model_without_ddp, logger)
+        #acc1, acc5, loss = validate(config, data_loader_val, model)
+        #logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+
+
     logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
@@ -129,7 +187,7 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, 
 
     start = time.time()
     end = time.time()
-    for idx, (img, mask, _) in enumerate(data_loader):
+    for idx, (img, mask) in enumerate(data_loader):
         img = img.cuda(non_blocking=True)
         mask = mask.cuda(non_blocking=True)
 

@@ -95,6 +95,26 @@ class CustomImageDataset(Dataset):
         return self.base_transform(img)
 
 
+# 修改CustomImageDataset类为支持文件夹的结构
+
+class CustomImageDataset(Dataset):
+    def __init__(self, img_dir, img_size=224):
+        self.img_paths = [os.path.join(img_dir, f) for f in os.listdir(img_dir) 
+                         if f.endswith(('jpg', 'png'))]
+        self.transform = T.Compose([
+            T.RandomResizedCrop(img_size, scale=(0.67, 1.), ratio=(3./4., 4./3.)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
+        ])
+    
+    def __len__(self):
+        return len(self.img_paths)
+    
+    def __getitem__(self, idx):
+        img = Image.open(self.img_paths[idx]).convert('RGB')
+        return self.transform(img)
 
 class SimMIMTransform:
     """适配自定义数据集的增强转换"""
@@ -111,20 +131,20 @@ class SimMIMTransform:
         mask = self.mask_generator()
         return img_tensor, torch.from_numpy(mask).float()
 
+
+# 修改build_loader_simmim函数
 def build_loader_simmim(config):
-    """重构数据加载流程"""
-    # 自定义数据集初始化
+    # 初始化数据集（使用整个训练文件夹）
     dataset = CustomImageDataset(
-        img_paths=["/content/data/train/class1/00014.jpg"],  # 单图或多图路径
-        img_size=config.DATA.IMG_SIZE,
-        repeat_factor=1000  # 控制单图重复次数
+        img_dir="/content/drive/MyDrive/dior/data/train/class1",  # 指向训练集根目录
+        img_size=config.DATA.IMG_SIZE
     )
     
-    # 添加MIM转换层
+    # 添加MIM转换层（保持原有逻辑）
     mim_transform = SimMIMTransform(config)
     dataset = TransformWrapper(dataset, mim_transform)
     
-    # 分布式处理适配
+    # 分布式处理适配（保持原有逻辑）
     sampler = DistributedSampler(dataset) if dist.is_initialized() else None
     
     dataloader = DataLoader(
